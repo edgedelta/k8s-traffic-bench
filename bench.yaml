@@ -1,0 +1,858 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{TEST_NAME}}
+spec:
+  ttlSecondsAfterFinished: 3600  # Delete job 1 hour after completion
+  backoffLimit: 1
+  template:
+    metadata:
+      labels:
+        app: load-test
+    spec:
+      serviceAccountName: load-test-sa
+      containers:
+      # monitoring
+      - name: resource-monitor
+        securityContext:
+          runAsUser: 1000
+          runAsGroup: 1000
+        image: bitnami/kubectl:latest
+        command:
+        - "/bin/bash"
+        - "-c"
+        - |
+          # Create shared directories between containers
+          TIMESTAMP=$(date +%Y%m%d_%H%M%S)
+          TEST_DIR="/results/test-${TIMESTAMP}"
+          METRICS_DIR="$TEST_DIR/metrics"
+          mkdir -p $METRICS_DIR
+          
+          # Monitor script
+          cat > /tmp/monitor.sh << 'EOF'
+          #!/bin/bash
+          DEPLOYMENT_NAME=$1
+          DEPLOYMENT_NAMESPACE=$2
+          METRICS_DIR=$3
+          DURATION=$4
+          INTERVAL=${MONITORING_INTERVAL:-30}
+          
+          # Create headers
+          echo "timestamp,pod_name,cpu_usage,memory_usage,traffic_tier" > $METRICS_DIR/cpu_memory.csv
+          
+          # Traffic tiers based on elapsed time
+          DURATION_MINUTES=${DURATION_MINUTES:-5}
+          LOW_END=$((DURATION_MINUTES * 60))
+          MEDIUM_END=$((DURATION_MINUTES * 2 * 60))
+          HIGH_END=$((DURATION_MINUTES * 3 * 60))
+          PEAK_END=$((DURATION_MINUTES * 4 * 60))
+          
+          START_TIME=$(date +%s)
+          END_TIME=$((START_TIME + DURATION))
+          
+          echo "Starting resource monitoring for $DEPLOYMENT_NAME in $DEPLOYMENT_NAMESPACE"
+          echo "Metrics will be collected every $INTERVAL seconds for $DURATION seconds"
+          echo "Traffic tiers: low (0-${LOW_END}s), medium (${LOW_END}-${MEDIUM_END}s), high (${MEDIUM_END}-${HIGH_END}s), peak (${HIGH_END}-${PEAK_END}s)"
+          echo "Results will be saved to $METRICS_DIR"
+          
+          # Main monitoring loop
+          while [ $(date +%s) -lt $END_TIME ]; do
+            CURRENT_TIME=$(date +%s)
+            ELAPSED=$((CURRENT_TIME - START_TIME))
+            
+            # Determine traffic tier
+            if [ $ELAPSED -lt $LOW_END ]; then
+              TIER="low"
+            elif [ $ELAPSED -lt $MEDIUM_END ]; then
+              TIER="medium"
+            elif [ $ELAPSED -lt $HIGH_END ]; then
+              TIER="high"
+            elif [ $ELAPSED -lt $PEAK_END ]; then
+              TIER="peak"
+            else
+              TIER="cooldown"
+            fi
+            
+            echo "Collecting metrics at $(date) - Traffic tier: $TIER (Elapsed: $ELAPSED seconds)"
+            TS=$(date +"%Y-%m-%d %H:%M:%S")
+
+            PODS=""
+            # Try app label first
+            PODS=$(kubectl get pods -n $DEPLOYMENT_NAMESPACE -l app=$DEPLOYMENT_NAME -o jsonpath='{.items[*].metadata.name}' 2>/dev/null || echo "")
+            
+            # If no pods found, try app.kubernetes.io/name label
+            if [ -z "$PODS" ]; then
+              PODS=$(kubectl get pods -n $DEPLOYMENT_NAMESPACE -l app.kubernetes.io/name=$DEPLOYMENT_NAME -o jsonpath='{.items[*].metadata.name}' 2>/dev/null || echo "")
+            fi
+            
+            # If still no pods, use grep (less precise)
+            if [ -z "$PODS" ]; then
+              PODS=$(kubectl get pods -n $DEPLOYMENT_NAMESPACE -o name | grep $DEPLOYMENT_NAME | sed 's|pod/||g' || echo "")
+            fi
+            
+            if [ -z "$PODS" ]; then
+              echo "No pods found for $DEPLOYMENT_NAME in $DEPLOYMENT_NAMESPACE"
+            else
+              for POD in $PODS; do
+                # Get CPU & memory usage
+                METRICS=$(kubectl top pod $POD -n $DEPLOYMENT_NAMESPACE --no-headers 2>/dev/null || echo "")
+                if [ -n "$METRICS" ]; then
+                  CPU=$(echo $METRICS | awk '{print $2}')
+                  MEM=$(echo $METRICS | awk '{print $3}')
+                  echo "$TS,$POD,$CPU,$MEM,$TIER" >> $METRICS_DIR/cpu_memory.csv
+                fi
+              done
+            fi
+            
+            sleep $INTERVAL
+          done
+          
+          echo "Resource monitoring completed. Results saved to $METRICS_DIR"
+          EOF
+          
+          chmod +x /tmp/monitor.sh
+          
+          # Signal to let k6 know resource monitor ready
+          echo "$TIMESTAMP" > /results/monitor-ready.txt
+          
+          TOTAL_MINUTES=$((DURATION_MINUTES * 4 + 1))  # 4 phases + cooldown
+          TOTAL_SECONDS=$((TOTAL_MINUTES * 60))
+
+          echo "Starting monitoring for ${TOTAL_SECONDS} seconds..."
+          /tmp/monitor.sh "${DEPLOYMENT_NAME}" "${DEPLOYMENT_NAMESPACE}" "$METRICS_DIR" $TOTAL_SECONDS
+          
+          # Signal that monitoring is complete for report generator
+          echo "$TIMESTAMP" > /results/monitor-done.txt
+          echo "Monitoring completed"
+        env:
+        - name: DEPLOYMENT_NAME
+          value: "{{DEPLOYMENT_NAME}}"
+        - name: DEPLOYMENT_NAMESPACE
+          value: "{{DEPLOYMENT_NAMESPACE}}"
+        - name: DURATION_MINUTES
+          value: "{{DURATION_MINUTES}}"
+        - name: MONITORING_INTERVAL
+          value: "30"
+        volumeMounts:
+        - name: results-volume
+          mountPath: /results
+      
+      # k6 for load testing with different profiles
+      - name: k6-load-tester
+        securityContext:
+          runAsUser: 1000
+          runAsGroup: 1000
+        image: grafana/k6:latest
+        command:
+        - "/bin/sh"
+        - "-c"
+        - |
+          echo "Waiting for monitor to be ready..."
+          while [ ! -f /results/monitor-ready.txt ]; do
+            sleep 5
+          done
+          
+          TIMESTAMP=$(cat /results/monitor-ready.txt)
+          TEST_DIR="/results/test-${TIMESTAMP}"
+          
+          cat > /tmp/load-test.js << 'EOF'
+          import http from 'k6/http';
+          import { check, sleep } from 'k6';
+
+          // Get traffic rates from environment variables or use defaults
+          const LOW_VUS = parseInt(__ENV.LOW_VUS || '10');
+          const MEDIUM_VUS = parseInt(__ENV.MEDIUM_VUS || '50'); 
+          const HIGH_VUS = parseInt(__ENV.HIGH_VUS || '100');
+          const PEAK_VUS = parseInt(__ENV.PEAK_VUS || '200');
+          const DURATION_MINUTES = parseInt(__ENV.DURATION_MINUTES || '5');
+          const TARGET_SERVICES = __ENV.TARGET_SERVICES || 'http://http-server';
+
+          export const options = {
+            scenarios: {
+              low_traffic: {
+                executor: 'constant-vus',
+                vus: LOW_VUS,
+                duration: `${DURATION_MINUTES}m`,
+                tags: { traffic_level: 'low' },
+                startTime: '0s',
+              },
+              medium_traffic: {
+                executor: 'constant-vus',
+                vus: MEDIUM_VUS,
+                duration: `${DURATION_MINUTES}m`,
+                tags: { traffic_level: 'medium' },
+                startTime: `${DURATION_MINUTES}m`,
+              },
+              high_traffic: {
+                executor: 'constant-vus',
+                vus: HIGH_VUS,
+                duration: `${DURATION_MINUTES}m`,
+                tags: { traffic_level: 'high' },
+                startTime: `${DURATION_MINUTES * 2}m`,
+              },
+              peak_traffic_burst: {
+                executor: 'ramping-vus',
+                startVUs: HIGH_VUS,
+                stages: [
+                  { duration: '1m', target: PEAK_VUS },
+                  { duration: `${DURATION_MINUTES - 2}m`, target: PEAK_VUS },
+                  { duration: '1m', target: 0 },
+                ],
+                tags: { traffic_level: 'peak' },
+                startTime: `${DURATION_MINUTES * 3}m`,
+              },
+            },
+            thresholds: {
+              http_req_duration: ['p(95)<500'],
+              http_req_failed: ['rate<0.01'],
+            },
+          };
+
+          // List of services to test pod-to-pod communication
+          const services = TARGET_SERVICES.split(',').map(url => url.trim());
+
+          function getTrafficLevel(__VU, __ITER) {
+            if (__VU <= 10) return 'low';
+            if (__VU <= 50) return 'medium';
+            if (__VU <= 100) return 'high';
+            return 'peak';
+          }
+
+          export default function() {
+            const trafficLevel = getTrafficLevel(__VU, __ITER);
+            const targetService = services[Math.floor(Math.random() * services.length)];
+            
+            const response = http.get(targetService, {
+              headers: {
+                'X-Request-ID': `k6-load-test-${trafficLevel}-${__VU}-${__ITER}`,
+                'Content-Type': 'application/json',
+                'X-Traffic-Level': trafficLevel,
+              },
+            });
+            
+            check(response, {
+              'status is 200': (r) => r.status === 200,
+              'response time < 200ms': (r) => r.timings.duration < 200,
+            });
+            
+            // Adjust think time based on traffic level to simulate different user behavior
+            let thinkTime;
+            switch(trafficLevel) {
+              case 'low': thinkTime = Math.random() * 2 + 1; break;
+              case 'medium': thinkTime = Math.random() * 1 + 0.5; break;
+              case 'high': thinkTime = Math.random() * 0.5 + 0.1; break;
+              case 'peak': thinkTime = Math.random() * 0.2 + 0.05; break;
+              default: thinkTime = 1;
+            }
+            
+            sleep(thinkTime);
+          }
+          EOF
+          
+          echo "Starting k6 load test..."
+          k6 run --summary-export="$TEST_DIR/k6-summary.json" /tmp/load-test.js
+          
+          # Signal that k6 test is complete
+          echo "$TIMESTAMP" > /results/k6-done.txt
+          
+          echo "k6 load test completed"
+        env:
+        - name: LOW_VUS
+          value: "{{LOW_VUS}}"
+        - name: MEDIUM_VUS
+          value: "{{MEDIUM_VUS}}"
+        - name: HIGH_VUS
+          value: "{{HIGH_VUS}}"
+        - name: PEAK_VUS
+          value: "{{PEAK_VUS}}"
+        - name: DURATION_MINUTES
+          value: "{{DURATION_MINUTES}}"
+        - name: TARGET_SERVICES
+          value: "{{TARGET_SERVICES}}"  # Comma separated list of services
+        volumeMounts:
+        - name: results-volume
+          mountPath: /results
+      
+      # report generator
+      - name: report-generator
+        securityContext:
+          runAsUser: 1000
+          runAsGroup: 1000
+        image: jupyter/scipy-notebook:latest 
+        command:
+        - "/bin/bash"
+        - "-c"
+        - |
+          echo "Installing dependencies..."
+          pip install --user awscli
+          export PATH=$PATH:~/.local/bin
+          
+          echo "Waiting for tests to complete..."
+          echo "Current contents of /results directory:"
+          ls -la /results/
+          
+          while [ ! -f /results/monitor-done.txt ] || [ ! -f /results/k6-done.txt ]; do
+            echo "Waiting: Monitor done: $([ -f /results/monitor-done.txt ] && echo 'Yes' || echo 'No'), K6 done: $([ -f /results/k6-done.txt ] && echo 'Yes' || echo 'No')"
+            sleep 30
+            echo "Updated contents of /results directory:"
+            ls -la /results/
+          done
+          
+          # Get timestamp
+          TIMESTAMP=$(cat /results/monitor-done.txt)
+          TEST_DIR="/results/test-${TIMESTAMP}"
+          
+          # report generator script
+          cat > /tmp/report.py << 'EOF'
+          #!/usr/bin/env python3
+          import argparse
+          import os
+          import json
+          import pandas as pd
+          import numpy as np
+          import matplotlib
+          matplotlib.use('Agg')
+          import matplotlib.pyplot as plt
+          import base64
+          from io import BytesIO
+          from datetime import datetime
+
+          def parse_args():
+              parser = argparse.ArgumentParser(description="Generate load test report")
+              parser.add_argument("--test-dir", required=True, help="Test directory")
+              parser.add_argument("--output", required=True, help="Output HTML file")
+              parser.add_argument("--low-vus", type=int, default=int(os.environ.get('LOW_VUS', 10)), help="Low tier VUs")
+              parser.add_argument("--medium-vus", type=int, default=int(os.environ.get('MEDIUM_VUS', 50)), help="Medium tier VUs")
+              parser.add_argument("--high-vus", type=int, default=int(os.environ.get('HIGH_VUS', 100)), help="High tier VUs")
+              parser.add_argument("--peak-vus", type=int, default=int(os.environ.get('PEAK_VUS', 200)), help="Peak tier VUs")
+              parser.add_argument("--duration-minutes", type=int, default=int(os.environ.get('DURATION_MINUTES', 5)), help="Duration per tier in minutes")
+              return parser.parse_args()
+
+          def plot_to_base64(fig):
+              buf = BytesIO()
+              fig.savefig(buf, format='png', dpi=100, bbox_inches='tight')
+              buf.seek(0)
+              img_str = base64.b64encode(buf.read()).decode('utf-8')
+              buf.close()
+              return img_str
+
+          def create_cpu_plot(df):
+              if df is None or df.empty:
+                  return None
+              
+              fig, ax = plt.subplots(figsize=(10, 6))
+              
+              # Traffic tier colors
+              colors = {
+                  'low': 'green',
+                  'medium': 'blue',
+                  'high': 'orange',
+                  'peak': 'red',
+                  'cooldown': 'gray'
+              }
+              
+              # Convert timestamp to datetime
+              if df['timestamp'].dtype == object:
+                  df['timestamp'] = pd.to_datetime(df['timestamp'])
+              
+              # Plot each pod in each traffic tier
+              for tier in df['traffic_tier'].unique():
+                  tier_data = df[df['traffic_tier'] == tier]
+                  for pod in tier_data['pod_name'].unique():
+                      pod_data = tier_data[tier_data['pod_name'] == pod]
+                      ax.plot(pod_data['timestamp'], pod_data['cpu_numeric'], 
+                            marker='o', linestyle='-', alpha=0.7,
+                            label=f"{pod} ({tier})",
+                            color=colors.get(tier, 'black'))
+              
+              # Highlight traffic tiers
+              tier_groups = df.groupby('traffic_tier')
+              for tier, group in tier_groups:
+                  if not group.empty:
+                      min_time = group['timestamp'].min()
+                      max_time = group['timestamp'].max()
+                      ax.axvspan(min_time, max_time, alpha=0.1, color=colors.get(tier, 'gray'),
+                                label=f"{tier} tier" if tier not in ax.get_legend_handles_labels()[1] else "")
+              
+              ax.set_title('CPU Usage During Load Test')
+              ax.set_xlabel('Time')
+              ax.set_ylabel('CPU (millicores)')
+              ax.grid(True, linestyle='--', alpha=0.7)
+              
+              # Create custom legend
+              handles, labels = ax.get_legend_handles_labels()
+              by_label = dict(zip(labels, handles))
+              ax.legend(by_label.values(), by_label.keys(), loc='upper left', bbox_to_anchor=(1.05, 1))
+              
+              fig.tight_layout()
+              return plot_to_base64(fig)
+
+          def create_memory_plot(df):
+              if df is None or df.empty:
+                  return None
+              
+              fig, ax = plt.subplots(figsize=(10, 6))
+              
+              colors = {
+                  'low': 'green',
+                  'medium': 'blue',
+                  'high': 'orange',
+                  'peak': 'red',
+                  'cooldown': 'gray'
+              }
+              
+              if df['timestamp'].dtype == object:
+                  df['timestamp'] = pd.to_datetime(df['timestamp'])
+              
+              for tier in df['traffic_tier'].unique():
+                  tier_data = df[df['traffic_tier'] == tier]
+                  for pod in tier_data['pod_name'].unique():
+                      pod_data = tier_data[tier_data['pod_name'] == pod]
+                      ax.plot(pod_data['timestamp'], pod_data['memory_mi'], 
+                            marker='o', linestyle='-', alpha=0.7,
+                            label=f"{pod} ({tier})",
+                            color=colors.get(tier, 'black'))
+              
+              tier_groups = df.groupby('traffic_tier')
+              for tier, group in tier_groups:
+                  if not group.empty:
+                      min_time = group['timestamp'].min()
+                      max_time = group['timestamp'].max()
+                      ax.axvspan(min_time, max_time, alpha=0.1, color=colors.get(tier, 'gray'),
+                                label=f"{tier} tier" if tier not in ax.get_legend_handles_labels()[1] else "")
+              
+              ax.set_title('Memory Usage During Load Test')
+              ax.set_xlabel('Time')
+              ax.set_ylabel('Memory (MiB)')
+              ax.grid(True, linestyle='--', alpha=0.7)
+              
+              handles, labels = ax.get_legend_handles_labels()
+              by_label = dict(zip(labels, handles))
+              ax.legend(by_label.values(), by_label.keys(), loc='upper left', bbox_to_anchor=(1.05, 1))
+              
+              fig.tight_layout()
+              return plot_to_base64(fig)
+
+          def extract_k6_stats(test_dir):
+            stats = {
+                'summary': {},
+                'http_metrics': {}
+            }
+            json_summary_path = os.path.join(test_dir, "k6-summary.json")
+            if os.path.exists(json_summary_path):
+                try:
+                    with open(json_summary_path, 'r') as f:
+                        import json
+                        data = json.load(f)
+                        if 'metrics' in data:
+                            metrics = data['metrics']
+                            for key, value in metrics.items():
+                                if key.startswith('http_'):
+                                    stats['http_metrics'][key] = value
+                            
+                            if 'http_reqs' in metrics:
+                                stats['summary']['total_requests'] = metrics['http_reqs'].get('count', 0)
+                            
+                            if 'http_req_duration' in metrics:
+                                stats['summary']['avg_duration'] = metrics['http_req_duration'].get('avg', 0)
+                                stats['summary']['p95_duration'] = metrics['http_req_duration'].get('p(95)', 0)
+                                stats['summary']['max_duration'] = metrics['http_req_duration'].get('max', 0)
+                            
+                            if 'http_req_failed' in metrics:
+                                stats['summary']['failure_rate'] = metrics['http_req_failed'].get('rate', 0) * 100
+                            
+                            if 'iterations' in metrics:
+                                stats['summary']['iterations'] = metrics['iterations'].get('count', 0)
+                            
+                            return stats
+                except Exception as e:
+                    print(f"Error reading k6 JSON summary: {e}")
+        
+
+
+          def main():
+              args = parse_args()
+              test_dir = args.test_dir
+              output_file = args.output
+              low_vus = args.low_vus
+              medium_vus = args.medium_vus
+              high_vus = args.high_vus
+              peak_vus = args.peak_vus
+              duration_min = args.duration_minutes
+              
+              # Load metrics data
+              metrics_dir = os.path.join(test_dir, "metrics")
+              plots = {}
+              
+              # CPU and memory
+              cpu_memory_file = os.path.join(metrics_dir, "cpu_memory.csv")
+              if os.path.exists(cpu_memory_file):
+                  try:
+                      df = pd.read_csv(cpu_memory_file)
+                      df['timestamp'] = pd.to_datetime(df['timestamp'])
+                      
+                      if 'cpu_usage' in df.columns:
+                          # Convert CPU string to numeric
+                          df['cpu_numeric'] = df['cpu_usage'].str.replace('m', '').astype(float)
+                          plots['cpu_plot'] = create_cpu_plot(df)
+                      
+                      if 'memory_usage' in df.columns:
+                          # Convert memory string to numeric (Mi)
+                          def convert_memory(mem_str):
+                              if pd.isna(mem_str):
+                                  return np.nan
+                              if 'Gi' in mem_str:
+                                  return float(mem_str.replace('Gi', '')) * 1024
+                              elif 'Mi' in mem_str:
+                                  return float(mem_str.replace('Mi', ''))
+                              elif 'Ki' in mem_str:
+                                  return float(mem_str.replace('Ki', '')) / 1024
+                              else:
+                                  try:
+                                      return float(mem_str)
+                                  except:
+                                      return np.nan
+                          
+                          df['memory_mi'] = df['memory_usage'].apply(convert_memory)
+                          plots['memory_plot'] = create_memory_plot(df)
+                          
+                      cpu_summary = df.groupby(['traffic_tier', 'pod_name'])['cpu_numeric'].agg(['min', 'max', 'mean']).reset_index()
+                      memory_summary = df.groupby(['traffic_tier', 'pod_name'])['memory_mi'].agg(['min', 'max', 'mean']).reset_index()
+                  except Exception as e:
+                      print(f"Error processing CPU/memory data: {e}")
+              
+              # extract k6 stats
+              k6_stats = extract_k6_stats(test_dir)
+
+              # Create HTML report
+              html_parts = []
+              html_parts.append(f"""<!DOCTYPE html>
+              <html>
+              <head>
+                  <meta charset="UTF-8">
+                  <title>Load Test Report</title>
+                  <style>
+                      body {{ font-family: Arial, sans-serif; margin: 20px; }}
+                      h1, h2, h3 {{ color: #333; }}
+                      .container {{ max-width: 1200px; margin: 0 auto; }}
+                      .summary-box {{ background-color: #f8f9fa; border-radius: 5px; padding: 15px; margin-bottom: 20px; box-shadow: 0 1px 3px rgba(0,0,0,0.1); }}
+                      .plot-container {{ margin-bottom: 30px; text-align: center; }}
+                      table {{ width: 100%; border-collapse: collapse; margin-bottom: 20px; }}
+                      th, td {{ border: 1px solid #ddd; padding: 8px; text-align: left; }}
+                      th {{ background-color: #f2f2f2; }}
+                      tr:nth-child(even) {{ background-color: #f9f9f9; }}
+                      .traffic-low {{ background-color: rgba(0, 128, 0, 0.1); }}
+                      .traffic-medium {{ background-color: rgba(0, 0, 255, 0.1); }}
+                      .traffic-high {{ background-color: rgba(255, 165, 0, 0.1); }}
+                      .traffic-peak {{ background-color: rgba(255, 0, 0, 0.1); }}
+                  </style>
+              </head>
+              <body>
+                  <div class="container">
+                      <h1>Load Test Report</h1>
+                      <p>Generated on: {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}</p>
+                      
+                      <div class="summary-box">
+                          <h2>Test Summary</h2>
+                          <p>Test Time: {datetime.strptime(os.path.basename(test_dir).split("-")[1], "%Y%m%d_%H%M%S").strftime("%Y-%m-%d %H:%M:%S")}</p>
+                          
+                          <h3>Traffic Tiers</h3>
+                          <table>
+                              <tr>
+                                  <th>Traffic Level</th>
+                                  <th>Virtual Users</th>
+                                  <th>Duration</th>
+                              </tr>
+                              <tr class="traffic-low">
+                                  <td>Low</td>
+                                  <td>{low_vus} VUs</td>
+                                  <td>{duration_min} minutes</td>
+                              </tr>
+                              <tr class="traffic-medium">
+                                  <td>Medium</td>
+                                  <td>{medium_vus} VUs</td>
+                                  <td>{duration_min} minutes</td>
+                              </tr>
+                              <tr class="traffic-high">
+                                  <td>High</td>
+                                  <td>{high_vus} VUs</td>
+                                  <td>{duration_min} minutes</td>
+                              </tr>
+                              <tr class="traffic-peak">
+                                  <td>Peak</td>
+                                  <td>Up to {peak_vus} VUs</td>
+                                  <td>{duration_min} minutes</td>
+                              </tr>
+                          </table>
+                      </div>
+              """)
+
+              if k6_stats and k6_stats['summary']:
+                  html_parts.append("""
+                      <div class="summary-box">
+                          <h3>Load Test Results</h3>
+                          <table>
+                              <tr>
+                                  <th>Metric</th>
+                                  <th>Value</th>
+                              </tr>
+                  """)
+              
+                  for metric, value in k6_stats['summary'].items():
+                      formatted_metric = ' '.join(word.capitalize() for word in metric.split('_'))
+                      
+                      if 'duration' in metric:
+                          formatted_value = f"{value:.2f} ms"
+                      elif 'rate' in metric:
+                          formatted_value = f"{value:.2f}%"
+                      elif isinstance(value, float):
+                          formatted_value = f"{value:.2f}"
+                      else:
+                          formatted_value = f"{value:,}"
+                          
+                      html_parts.append(f"""
+                          <tr>
+                              <td>{formatted_metric}</td>
+                              <td>{formatted_value}</td>
+                          </tr>
+                      """)
+                      
+                  html_parts.append("</table></div>")
+              
+              # Add resource visualizations
+              html_parts.append("<h2>Resource Usage Visualizations</h2>")
+              
+              if 'cpu_plot' in plots and plots['cpu_plot']:
+                  html_parts.append(f"""
+                      <div class="plot-container">
+                          <h3>CPU Usage</h3>
+                          <img src="data:image/png;base64,{plots['cpu_plot']}" alt="CPU Usage Plot">
+                      </div>
+                  """)
+              
+              if 'memory_plot' in plots and plots['memory_plot']:
+                  html_parts.append(f"""
+                      <div class="plot-container">
+                          <h3>Memory Usage</h3>
+                          <img src="data:image/png;base64,{plots['memory_plot']}" alt="Memory Usage Plot">
+                      </div>
+                  """)
+              
+
+              # Add summary tables
+              html_parts.append("<h2>Resource Usage Summary</h2>")
+
+              if 'cpu_summary' in locals() and not cpu_summary.empty:
+                  html_parts.append("""
+                      <h3>CPU Usage (millicores)</h3>
+                      <table>
+                          <tr>
+                              <th>Traffic Level</th>
+                              <th>Pod</th>
+                              <th>Min</th>
+                              <th>Max</th>
+                              <th>Average</th>
+                          </tr>
+                  """)
+                  
+                  for _, row in cpu_summary.iterrows():
+                      traffic_class = f"traffic-{row['traffic_tier']}"
+                      html_parts.append(f"""
+                          <tr class="{traffic_class}">
+                              <td>{row['traffic_tier']}</td>
+                              <td>{row['pod_name']}</td>
+                              <td>{row['min']:.2f} m</td>
+                              <td>{row['max']:.2f} m</td>
+                              <td>{row['mean']:.2f} m</td>
+                          </tr>
+                      """)
+                  
+                  html_parts.append("</table>")
+
+              if 'memory_summary' in locals() and not memory_summary.empty:
+                  html_parts.append("""
+                      <h3>Memory Usage (MiB)</h3>
+                      <table>
+                          <tr>
+                              <th>Traffic Level</th>
+                              <th>Pod</th>
+                              <th>Min</th>
+                              <th>Max</th>
+                              <th>Average</th>
+                          </tr>
+                  """)
+                  
+                  for _, row in memory_summary.iterrows():
+                      traffic_class = f"traffic-{row['traffic_tier']}"
+                      html_parts.append(f"""
+                          <tr class="{traffic_class}">
+                              <td>{row['traffic_tier']}</td>
+                              <td>{row['pod_name']}</td>
+                              <td>{row['min']:.2f}</td>
+                              <td>{row['max']:.2f}</td>
+                              <td>{row['mean']:.2f}</td>
+                          </tr>
+                      """)
+                  
+                  html_parts.append("</table>")
+
+              html_parts.append("""
+              </div>
+              </body>
+              </html>
+              """)
+
+              with open(output_file, 'w') as f:
+                  f.write("\n".join(html_parts))
+
+              print(f"Report generated and saved to {output_file}")
+
+          if __name__ == "__main__":
+              main()
+          EOF
+
+          chmod +x /tmp/report.py
+
+          echo "Generating report..."
+          python /tmp/report.py --test-dir $TEST_DIR --output $TEST_DIR/report.html
+
+          echo "Creating archive..."
+          tar -czf $TEST_DIR.tar.gz -C $TEST_DIR .
+
+          if [ -n "$AWS_ACCESS_KEY_ID_FROM_SECRET" ] && [ -n "$AWS_SECRET_ACCESS_KEY_FROM_SECRET" ] && [ -n "$AWS_DEFAULT_REGION_FROM_SECRET" ]; then
+            echo "Using AWS credentials from secrets"
+            export AWS_ACCESS_KEY_ID=$AWS_ACCESS_KEY_ID_FROM_SECRET
+            export AWS_SECRET_ACCESS_KEY=$AWS_SECRET_ACCESS_KEY_FROM_SECRET
+            export AWS_DEFAULT_REGION=$AWS_DEFAULT_REGION_FROM_SECRET
+          else
+            echo "Using instance role or default credentials"
+          fi
+
+          S3_UPLOAD_ENABLED=false
+          if [ -n "$S3_BUCKET" ] && [ -n "$S3_PREFIX" ]; then
+            echo "Checking AWS credentials..."
+            if aws sts get-caller-identity &>/dev/null; then
+              S3_UPLOAD_ENABLED=true
+              echo "AWS credentials verified successfully"
+            else
+              echo "AWS credentials not available or invalid - S3 upload will be skipped"
+            fi
+          else
+            echo "S3 bucket or prefix not configured - S3 upload will be skipped"
+          fi
+
+          if [ "$S3_UPLOAD_ENABLED" = true ]; then
+            echo "Uploading to S3..."
+            aws s3 cp $TEST_DIR.tar.gz s3://${S3_BUCKET}/${S3_PREFIX}/load-test-${TIMESTAMP}.tar.gz
+
+            if [ -f "$TEST_DIR/report.html" ]; then
+              aws s3 cp $TEST_DIR/report.html s3://${S3_BUCKET}/${S3_PREFIX}/reports/load-test-${TIMESTAMP}.html
+              aws s3 cp $TEST_DIR/report.html s3://${S3_BUCKET}/${S3_PREFIX}/reports/latest.html
+            fi
+
+            # Indicate latest report on s3
+            echo "s3://${S3_BUCKET}/${S3_PREFIX}/load-test-${TIMESTAMP}.tar.gz" > /tmp/latest-report.txt
+            aws s3 cp /tmp/latest-report.txt s3://${S3_BUCKET}/${S3_PREFIX}/latest-report.txt
+            echo "Report generated and uploaded to S3"
+          else
+            echo "S3 upload skipped - report is still available locally at $TEST_DIR/report.html"
+          fi
+
+          if [ "$S3_UPLOAD_ENABLED" = true ] && [ -n "$SLACK_WEBHOOK_URL" ]; then
+            echo "Generating pre-signed URL for report..."
+            S3_OBJECT_PATH="s3://${S3_BUCKET}/${S3_PREFIX}/reports/load-test-${TIMESTAMP}.html"
+            REPORT_URL=$(aws s3 presign --expires-in 604800 "$S3_OBJECT_PATH")
+            
+            echo '{
+              "blocks": [
+                {
+                  "type": "header",
+                  "text": {
+                    "type": "plain_text",
+                    "text": "Load Test Report Available",
+                    "emoji": true
+                  }
+                },
+                {
+                  "type": "section",
+                  "text": {
+                    "type": "mrkdwn",
+                    "text": "A new load test has completed on '"$(date)"'"
+                  }
+                },
+                {
+                  "type": "section",
+                  "text": {
+                    "type": "mrkdwn",
+                    "text": "<'"${REPORT_URL}"'|View Detailed Report>"
+                  }
+                },
+                {
+                  "type": "context",
+                  "elements": [
+                    {
+                      "type": "plain_text",
+                      "text": "Test ID: load-test-'"${TIMESTAMP}"'",
+                      "emoji": true
+                    }
+                  ]
+                }
+              ]
+            }' > /tmp/slack-payload.json
+
+            # Send the notification to Slack
+            echo "Sending report URL to Slack..."
+            curl -s -X POST -H "Content-type: application/json" --data @/tmp/slack-payload.json "$SLACK_WEBHOOK_URL"
+            echo "Slack notification sent"
+          fi
+        env:
+        - name: S3_BUCKET
+          valueFrom:
+            secretKeyRef:
+              name: load-test-credentials
+              key: bucket
+              optional: true
+        - name: S3_PREFIX
+          value: "load-tests"
+        - name: AWS_ACCESS_KEY_ID_FROM_SECRET
+          valueFrom:
+            secretKeyRef:
+              name: load-test-credentials
+              key: access-key
+              optional: true
+        - name: AWS_SECRET_ACCESS_KEY_FROM_SECRET
+          valueFrom:
+            secretKeyRef:
+              name: load-test-credentials
+              key: secret-key
+              optional: true
+        - name: AWS_DEFAULT_REGION_FROM_SECRET
+          valueFrom:
+            secretKeyRef:
+              name: load-test-credentials
+              key: region
+              optional: true
+        - name: SLACK_WEBHOOK_URL
+          valueFrom:
+            secretKeyRef:
+              name: load-test-credentials
+              key: slack-url
+              optional: true
+        - name: LOW_VUS
+          value: "{{LOW_VUS}}"
+        - name: MEDIUM_VUS
+          value: "{{MEDIUM_VUS}}"
+        - name: HIGH_VUS
+          value: "{{HIGH_VUS}}"
+        - name: PEAK_VUS
+          value: "{{PEAK_VUS}}"
+        - name: DURATION_MINUTES
+          value: "{{DURATION_MINUTES}}"
+        volumeMounts:
+        - name: results-volume
+          mountPath: /results
+      volumes:
+      - name: results-volume
+        emptyDir:
+          sizeLimit: 2Gi
+      restartPolicy: Never
